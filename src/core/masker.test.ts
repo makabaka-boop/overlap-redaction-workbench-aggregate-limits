@@ -5,6 +5,7 @@ import {
   LIMITS,
   MaskError,
   addEntry,
+  assertWorkingSetLimits,
   buildAutomaton,
   checkPatternValue,
   maskText,
@@ -573,6 +574,141 @@ describe('短语编辑：违规返回 INVALID_PATTERN 且不改动列表', () =>
     toggleEntry(b, 0, false)
     removeEntry(b, 0)
     expect(JSON.stringify(b)).toBe(snapshot)
+  })
+})
+
+describe('工作集聚合约束（编辑路径与导入同契约）', () => {
+  /**
+   * 生成 n 条互不重复、定长 len 的合法短语：数字零填充到 len 位
+   * （调用方保证 n ≤ 10^len 即互不重复）。len=6 / n=50000 时
+   * 50000 × 6 = 300000，恰好同时压住两条上界。
+   */
+  function uniqueEntries(n: number, len: number): PatternEntry[] {
+    const out: PatternEntry[] = []
+    for (let i = 0; i < n; i++) {
+      out.push({ value: String(i).padStart(len, '0'), enabled: true })
+    }
+    return out
+  }
+
+  describe('数量边界（minPatterns=1 / maxPatterns=50000）', () => {
+    it('49,999 条时允许增长到恰好 50,000 条', () => {
+      const entries = uniqueEntries(LIMITS.maxPatterns - 1, 6)
+      expect(entries).toHaveLength(49_999)
+      const next = addEntry(entries, String(49_999).padStart(6, '0'))
+      expect(next).toHaveLength(50_000)
+      expect(entries).toHaveLength(49_999) // 入参不被修改
+    })
+
+    it('50,000 条时新增第 50,001 条 → INVALID_PATTERN（数量上界）', () => {
+      // 用 5 长短语隔离“数量上界”：总长仅 250,000，越界纯粹由条数造成
+      const entries = uniqueEntries(LIMITS.maxPatterns, 5)
+      expectMaskError(INVALID_PATTERN, () => addEntry(entries, '50000'))
+      expect(entries).toHaveLength(50_000)
+    })
+
+    it('恰好 50,000 条且总长恰好 300,000：新增被拒，但启停/删除/等长改写兼容', () => {
+      const entries = uniqueEntries(LIMITS.maxPatterns, 6)
+      expect(entries.reduce((s, e) => s + e.value.length, 0)).toBe(300_000)
+      // 新增无论长短都越界
+      expectMaskError(INVALID_PATTERN, () => addEntry(entries, '999999'))
+      // 启停不触碰聚合约束
+      expect(toggleEntry(entries, 0, false)[0].enabled).toBe(false)
+      // 等长改写（唯一值）总长不变，允许
+      const updated = updateEntry(entries, 0, 'z'.repeat(6))
+      expect(updated[0].value).toBe('z'.repeat(6))
+      expect(updated).toHaveLength(50_000)
+      // 删除一条后回落到 49,999，可以再补回边界
+      const removed = removeEntry(entries, 0)
+      expect(removed).toHaveLength(49_999)
+      const back = addEntry(removed, 'z'.repeat(6))
+      expect(back).toHaveLength(50_000)
+    })
+
+    it('删除唯一条目会留下空工作集 → INVALID_PATTERN，动作被拒绝', () => {
+      const only: PatternEntry[] = [{ value: 'a', enabled: true }]
+      expectMaskError(INVALID_PATTERN, () => removeEntry(only, 0))
+      expect(only).toEqual([{ value: 'a', enabled: true }]) // 入参不被修改
+    })
+
+    it('两条删一条后仍可继续启停；再删第二条才被拒', () => {
+      const two: PatternEntry[] = [
+        { value: 'a', enabled: true },
+        { value: 'b', enabled: false },
+      ]
+      const one = removeEntry(two, 0)
+      expect(one.map((e) => e.value)).toEqual(['b'])
+      expect(toggleEntry(one, 0, true)[0].enabled).toBe(true)
+      expectMaskError(INVALID_PATTERN, () => removeEntry(one, 0))
+    })
+  })
+
+  describe('总长边界（maxTotalPatternLength=300,000）', () => {
+    it('总长恰好 300,000 时：新增/改长被拒，等长改写与缩短后增长兼容', () => {
+      const entries = uniqueEntries(3000, 100)
+      expect(entries).toHaveLength(3000)
+      expect(entries.reduce((s, e) => s + e.value.length, 0)).toBe(300_000)
+
+      // 新增哪怕 1 个代码单元也越界（值本身合法、不重复）
+      expectMaskError(INVALID_PATTERN, () => addEntry(entries, 'w'))
+      // 把一条改长 1 → 300,001，拒绝
+      const longer = 'z' + entries[0].value // 101 长，唯一
+      expect(longer).toHaveLength(101)
+      expectMaskError(INVALID_PATTERN, () => updateEntry(entries, 0, longer))
+
+      // 等长改写：总长仍 300,000，允许
+      const same = updateEntry(entries, 0, 'z'.repeat(100))
+      expect(same.reduce((s, e) => s + e.value.length, 0)).toBe(300_000)
+
+      // 缩短 1 → 299,999；再新增 1 长恰好回到 300,000；继续新增才被拒
+      const shorter = updateEntry(entries, 0, 'z'.repeat(99))
+      expect(shorter.reduce((s, e) => s + e.value.length, 0)).toBe(299_999)
+      const refilled = addEntry(shorter, 'w')
+      expect(refilled.reduce((s, e) => s + e.value.length, 0)).toBe(300_000)
+      expectMaskError(INVALID_PATTERN, () => addEntry(refilled, 'v'))
+
+      // 所有拒绝路径都不修改入参
+      expect(entries.reduce((s, e) => s + e.value.length, 0)).toBe(300_000)
+      expect(entries[0].value).toBe(String(0).padStart(100, '0'))
+    })
+
+    it('新增一条长 200 的短语使总长越界 → INVALID_PATTERN（单条本身合法）', () => {
+      const entries = uniqueEntries(3000, 100)
+      expectMaskError(INVALID_PATTERN, () => addEntry(entries, 'z'.repeat(200)))
+    })
+
+    it('缩短到边界以下后允许改长回恰好 300,000', () => {
+      const entries = uniqueEntries(3000, 100)
+      // 先删掉一条 → 299,900；再用一条恰好 100 长的新值补回 300,000
+      const removed = removeEntry(entries, 0)
+      expect(removed.reduce((s, e) => s + e.value.length, 0)).toBe(299_900)
+      const next = addEntry(removed, 'z'.repeat(100))
+      expect(next.reduce((s, e) => s + e.value.length, 0)).toBe(300_000)
+    })
+  })
+
+  describe('assertWorkingSetLimits 直接把关候选工作集', () => {
+    it('空工作集 / 50,001 条 / 总长 300,001 → INVALID_PATTERN', () => {
+      expectMaskError(INVALID_PATTERN, () => assertWorkingSetLimits([]))
+      const tooMany = [...uniqueEntries(50_000, 5), { value: '50000', enabled: true }]
+      expect(tooMany).toHaveLength(50_001)
+      expectMaskError(INVALID_PATTERN, () => assertWorkingSetLimits(tooMany))
+      const tooLong = uniqueEntries(3000, 100)
+      tooLong[0] = { value: 'z'.repeat(101), enabled: true }
+      expect(tooLong.reduce((s, e) => s + e.value.length, 0)).toBe(300_001)
+      expectMaskError(INVALID_PATTERN, () => assertWorkingSetLimits(tooLong))
+    })
+
+    it('恰好边界（1 条 / 50,000 条且 300,000 长 / 3,000 条各 100 长）放行', () => {
+      expect(() => assertWorkingSetLimits([{ value: 'a', enabled: true }])).not.toThrow()
+      expect(() => assertWorkingSetLimits(uniqueEntries(50_000, 6))).not.toThrow()
+      expect(() => assertWorkingSetLimits(uniqueEntries(3000, 100))).not.toThrow()
+    })
+
+    it('只校验聚合约束，不替代单条/查重：停用不影响结果', () => {
+      const entries = uniqueEntries(2, 10).map((e, i) => ({ ...e, enabled: i === 0 }))
+      expect(() => assertWorkingSetLimits(entries)).not.toThrow()
+    })
   })
 })
 

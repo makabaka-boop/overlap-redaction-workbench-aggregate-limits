@@ -373,9 +373,32 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
 
 // ---------------------------------------------------------------------------
 // 短语编辑：所有变更从原文重算由调用方（页面）负责；这里只做不可变更新与
-// 校验。任何违规抛 INVALID_PATTERN，且函数式语义保证调用方状态不会被部分
-// 修改——“不覆盖已采纳稿”由页面在捕获异常后不提交状态实现。
+// 校验。校验覆盖与 parseInput **完全相同的一组契约**——单条长度/字符集/重复
+// 之外，还包括工作集聚合约束（条目数 1..50000、总长 ≤ 300000）。任何违规
+// 抛 INVALID_PATTERN，且函数式语义保证调用方状态不会被部分修改——因此任何
+// 已提交工作集（含已采纳稿）都满足原输入契约、可被再次载入；“不覆盖已采纳
+// 稿”由页面在捕获异常后不提交状态实现。
 // ---------------------------------------------------------------------------
+
+/**
+ * 工作集聚合约束（与 parseInput 对 patterns 把关的同一组上/下界）：
+ * 条目数 1..50000，全部短语长度之和 ≤ 300000。增改 / 删除后的**候选**
+ * 工作集必须整体满足，否则抛 INVALID_PATTERN，由调用方拒绝当前动作并
+ * 保留上一次成功快照。载入合法性由 parseInput 以 INVALID_INPUT 单独把关。
+ * 单条长度（1..200）与字符集由 checkPatternValue 在构造候选前保证。
+ */
+export function assertWorkingSetLimits(entries: readonly PatternEntry[]): void {
+  if (entries.length < LIMITS.minPatterns || entries.length > LIMITS.maxPatterns) {
+    throw new MaskError(INVALID_PATTERN)
+  }
+  let total = 0
+  for (let i = 0; i < entries.length; i++) {
+    total += entries[i].value.length
+    if (total > LIMITS.maxTotalPatternLength) {
+      throw new MaskError(INVALID_PATTERN)
+    }
+  }
+}
 
 function assertIndex(entries: readonly PatternEntry[], index: number): void {
   if (!Number.isInteger(index) || index < 0 || index >= entries.length) {
@@ -392,14 +415,27 @@ function assertNotDuplicate(entries: readonly PatternEntry[], value: string, exc
   if (values.has(value)) throw new MaskError(INVALID_PATTERN)
 }
 
-/** 新增短语：空串/非法字符/超长/重复 → INVALID_PATTERN。 */
+/**
+ * 新增短语：空串/非法字符/超长/重复 → INVALID_PATTERN；
+ * 候选工作集条目数超过 50000 或总长超过 300000 同样 INVALID_PATTERN。
+ */
 export function addEntry(entries: readonly PatternEntry[], value: string): PatternEntry[] {
   checkPatternValue(value)
+  // 聚合上界先于查重 / 构造候选：满 50000 条（或总长将越界）时直接拒绝
+  if (entries.length >= LIMITS.maxPatterns) {
+    throw new MaskError(INVALID_PATTERN)
+  }
+  if (totalLength(entries) + value.length > LIMITS.maxTotalPatternLength) {
+    throw new MaskError(INVALID_PATTERN)
+  }
   assertNotDuplicate(entries, value)
   return [...entries, { value, enabled: true }]
 }
 
-/** 修改短语：空串/非法字符/超长/重复/下标越界 → INVALID_PATTERN。 */
+/**
+ * 修改短语：空串/非法字符/超长/重复/下标越界 → INVALID_PATTERN；
+ * 替换后候选工作集总长超过 300000（条目数不变）同样 INVALID_PATTERN。
+ */
 export function updateEntry(
   entries: readonly PatternEntry[],
   index: number,
@@ -408,10 +444,12 @@ export function updateEntry(
   assertIndex(entries, index)
   checkPatternValue(value)
   assertNotDuplicate(entries, value, index)
-  return entries.map((e, i) => (i === index ? { ...e, value } : e))
+  const next = entries.map((e, i) => (i === index ? { ...e, value } : e))
+  assertWorkingSetLimits(next)
+  return next
 }
 
-/** 启用/停用单条；下标越界 → INVALID_PATTERN。 */
+/** 启用/停用单条；下标越界 → INVALID_PATTERN。启停不改变聚合约束。 */
 export function toggleEntry(
   entries: readonly PatternEntry[],
   index: number,
@@ -421,8 +459,20 @@ export function toggleEntry(
   return entries.map((e, i) => (i === index ? { ...e, enabled } : e))
 }
 
-/** 删除单条；下标越界 → INVALID_PATTERN。 */
+/**
+ * 删除单条；下标越界 → INVALID_PATTERN；删除唯一条目会留下空工作集
+ * （低于 minPatterns），同样 INVALID_PATTERN，当前删除动作被整体拒绝。
+ */
 export function removeEntry(entries: readonly PatternEntry[], index: number): PatternEntry[] {
   assertIndex(entries, index)
-  return entries.filter((_, i) => i !== index)
+  const next = entries.filter((_, i) => i !== index)
+  assertWorkingSetLimits(next)
+  return next
+}
+
+/** 全部短语的长度之和（UTF-16 代码单元）。 */
+function totalLength(entries: readonly PatternEntry[]): number {
+  let total = 0
+  for (let i = 0; i < entries.length; i++) total += entries[i].value.length
+  return total
 }

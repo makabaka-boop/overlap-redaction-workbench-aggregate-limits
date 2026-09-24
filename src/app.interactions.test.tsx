@@ -34,7 +34,7 @@ vi.mock('./core/masker', async () => {
   }
 })
 
-import { maskText, type MaskResult } from './core/masker'
+import { LIMITS, maskText, type MaskResult } from './core/masker'
 import App from './App'
 
 const mockedMaskText = vi.mocked(maskText)
@@ -147,6 +147,72 @@ const workPreview = (c: HTMLElement) => c.querySelectorAll('pre.text-view')[0]!.
 const adoptedPreview = (c: HTMLElement) =>
   c.querySelectorAll('pre.text-view')[1]?.textContent ?? null
 const notice = (c: HTMLElement) => c.querySelector('[role=alert]')?.textContent ?? null
+
+// 预览统计条（“启用 X / Y 条 …”）与列表统计条（“显示 F / Y 条…”）
+const workStats = (c: HTMLElement) =>
+  [...c.querySelectorAll('p.stats')].find((p) => p.textContent!.includes('启用'))!.textContent!
+const listStats = (c: HTMLElement) =>
+  [...c.querySelectorAll('p.stats')].find((p) => p.textContent!.includes('显示'))!.textContent!
+
+/** 从“启用 X / Y 条”统计条解析启用数与总条数。 */
+function enabledOverTotal(c: HTMLElement): { enabled: number; total: number } {
+  const m = workStats(c).match(/启用\s*([\d,]+)\s*\/\s*([\d,]+)\s*条/)!
+  return { enabled: Number(m[1].replace(/,/g, '')), total: Number(m[2].replace(/,/g, '')) }
+}
+
+/** 从“显示 F / Y 条”统计条解析筛选数与总条数。 */
+function shownOverTotal(c: HTMLElement): { shown: number; total: number } {
+  const m = listStats(c).match(/显示\s*([\d,]+)\s*\/\s*([\d,]+)\s*条/)!
+  return { shown: Number(m[1].replace(/,/g, '')), total: Number(m[2].replace(/,/g, '')) }
+}
+
+/** 生成 n 条定长 len、互不重复的短语（n ≤ 10^len 时数字零填充即唯一）。 */
+function uniquePatterns(n: number, len: number): string[] {
+  const out: string[] = []
+  for (let i = 0; i < n; i++) out.push(String(i).padStart(len, '0'))
+  return out
+}
+
+/** 末尾新增框输入并点击“添加”；返回是否成功（成功后输入框清空）。 */
+function addPatternViaUI(c: HTMLElement, value: string): boolean {
+  const addInput = c
+    .querySelector<HTMLElement>('.add-row')!
+    .querySelector<HTMLInputElement>('input')!
+  typeInto(addInput, value)
+  click(buttonByText(c, '添加'))
+  return addInput.value === ''
+}
+
+/** 仅失焦提交某一行（不带随后点击）。 */
+function commitRow(c: HTMLElement, index: number, value: string): void {
+  typeInto(rowText(rows(c)[index]), value)
+  act(() => rowText(rows(c)[index]).blur())
+}
+
+/** 截获下载 Blob（沿用全仓约定：jsdom 不实现 createObjectURL）。 */
+function stubDownload(): { blobs: Blob[]; restore: () => void; downloaded: () => boolean } {
+  const blobs: Blob[] = []
+  let didDownload = false
+  const create = vi.fn((b: Blob | MediaSource) => {
+    blobs.push(b as Blob)
+    return 'blob:test'
+  })
+  const revoke = vi.fn()
+  Object.defineProperty(URL, 'createObjectURL', { value: create, configurable: true, writable: true })
+  Object.defineProperty(URL, 'revokeObjectURL', { value: revoke, configurable: true, writable: true })
+  const anchorClick = vi
+    .spyOn(HTMLAnchorElement.prototype, 'click')
+    .mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.download).toBe('redacted.txt')
+      expect(this.href).toBe('blob:test')
+      didDownload = true
+    })
+  return {
+    blobs,
+    downloaded: () => didDownload && create.mock.calls.length === 1 && revoke.mock.calls.length === 1,
+    restore: () => anchorClick.mockRestore(),
+  }
+}
 
 /**
  * 成套一致性断言：列表行（值 / 启停 / 计数文案）与工作预览同源于一次
@@ -488,5 +554,161 @@ describe('连续交互：失焦提交与随后点击不互相覆盖', () => {
     ])
     expect(workPreview(c)).toBe('aaaa ####')
     expect(notice(c)).toBe('COUNT_FAILED')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 聚合约束（条目数 1..50,000、总长 ≤ 300,000）的页面级验收：导入与编辑
+// 共用同一组契约。越界增改 / 删除唯一条目只拒绝当前动作（INVALID_PATTERN，
+// 且发生在重算之前），列表、计数、预览、采纳稿四类快照成套保留；恰好边界、
+// 启停、筛选 / 窗口化与合法下载保持兼容。
+// ---------------------------------------------------------------------------
+
+describe('聚合约束：越界动作只拒绝自身，四类快照成套一致', () => {
+  it('数量上界：增至恰好 50,000 成功，第 50,001 条被拒；启停/筛选/窗口化兼容', async () => {
+    const c = await renderApp('zzz', uniquePatterns(LIMITS.maxPatterns - 1, 6))
+    expect(shownOverTotal(c)).toEqual({ shown: 49_999, total: 49_999 })
+    expect(enabledOverTotal(c)).toEqual({ enabled: 49_999, total: 49_999 })
+
+    // 增长到恰好 50,000：成功，输入框清空，统计更新
+    expect(addPatternViaUI(c, String(49_999).padStart(6, '0'))).toBe(true)
+    expect(shownOverTotal(c)).toEqual({ shown: 50_000, total: 50_000 })
+    expect(enabledOverTotal(c)).toEqual({ enabled: 50_000, total: 50_000})
+    expect(notice(c)).toBeNull()
+
+    // 第 50,001 条：拒绝，输入框保留，列表 / 计数 / 预览全停在上一成功快照
+    expect(addPatternViaUI(c, '999999')).toBe(false)
+    expect(notice(c)).toBe('INVALID_PATTERN')
+    expect(shownOverTotal(c)).toEqual({ shown: 50_000, total: 50_000 })
+    expect(enabledOverTotal(c)).toEqual({ enabled: 50_000, total: 50_000 })
+    expect(workPreview(c)).toBe('zzz') // 数字短语对 'zzz' 零命中，预览为原文
+
+    // 边界处启停兼容：停用第一行 → 49,999/50,000，该行“未统计”，预览不变
+    click(rowCheck(rows(c)[0]))
+    expect(notice(c)).toBeNull()
+    expect(enabledOverTotal(c)).toEqual({ enabled: 49_999, total: 50_000 })
+    expect(rowCount(rows(c)[0]).textContent).toBe('未统计')
+
+    // 筛选 / 窗口化在满规模下仍按原始下标工作
+    setFilter(c, '049999')
+    expect(rows(c)).toHaveLength(1)
+    click(rowCheck(rows(c)[0])) // 停用最后一条（原始下标 49,999）
+    expect(enabledOverTotal(c)).toEqual({ enabled: 49_998, total: 50_000 })
+    expect(rowCount(rows(c)[0]).textContent).toBe('未统计')
+    setFilter(c, '')
+    expect(shownOverTotal(c)).toEqual({ shown: 50_000, total: 50_000 })
+
+    // 边界处删除一条后可以重新补回 50,000（补唯一 6 长新值）
+    click(rowDelete(rows(c)[0]))
+    expect(enabledOverTotal(c)).toEqual({ enabled: 49_998, total: 49_999 })
+    expect(addPatternViaUI(c, '999999')).toBe(true)
+    expect(enabledOverTotal(c)).toEqual({ enabled: 49_999, total: 50_000 })
+    expect(notice(c)).toBeNull()
+  })
+
+  it('最小数量：只剩一条时删除被 INVALID_PATTERN 拒绝，列表/计数/预览/采纳稿不变', async () => {
+    const c = await renderApp('abc abc', ['abc', 'xx'])
+    click(rowDelete(rows(c)[1])) // 删 'xx' → 工作集只剩 'abc'
+    expectRowsCoherent(c, [{ value: 'abc', enabled: true, count: 2 }])
+    expect(workPreview(c)).toBe('### ###')
+
+    // 先采纳这一“仅一条”的合法工作集
+    click(buttonByText(c, '采纳为下载稿'))
+    expect(adoptedPreview(c)).toBe('### ###')
+
+    // 删除唯一条目：拒绝；行仍在、计数与预览不变、错误提示显示
+    click(rowDelete(rows(c)[0]))
+    expect(notice(c)).toBe('INVALID_PATTERN')
+    expectRowsCoherent(c, [{ value: 'abc', enabled: true, count: 2 }])
+    expect(workPreview(c)).toBe('### ###')
+    expect(adoptedPreview(c)).toBe('### ###')
+
+    // 启停仍兼容；被拒删除不影响随后的成功动作（成功清除错误提示）
+    click(rowCheck(rows(c)[0]))
+    expect(notice(c)).toBeNull()
+    expectRowsCoherent(c, [{ value: 'abc', enabled: false, count: null }])
+    expect(workPreview(c)).toBe('abc abc')
+  })
+
+  it('总长上界：改长/新增超 300,000 被拒；缩短后可再增长到恰好边界，采纳/下载成套', async () => {
+    const c = await renderApp('z', uniquePatterns(3000, 100))
+    expect(enabledOverTotal(c)).toEqual({ enabled: 3000, total: 3000 })
+
+    // 把首条改成 101 长（值本身合法、唯一）：总长 300,001 → 拒绝，行值保留
+    commitRow(c, 0, 'z'.repeat(101))
+    expect(notice(c)).toBe('INVALID_PATTERN')
+    expect(rowText(rows(c)[0]).value).toBe('z'.repeat(101)) // 草稿保留便于继续修改
+    // 工作集未变：复选框仍勾选、计数来自上次成功快照（0 命中）、统计不变
+    expect(rowCheck(rows(c)[0]).checked).toBe(true)
+    expect(rowCount(rows(c)[0]).textContent).toBe('0')
+    expect(enabledOverTotal(c)).toEqual({ enabled: 3000, total: 3000 })
+    expect(workPreview(c)).toBe('z')
+
+    // 边界处新增也被拒（新增框保留输入）
+    expect(addPatternViaUI(c, 'w')).toBe(false)
+    expect(notice(c)).toBe('INVALID_PATTERN')
+
+    // 等长改写（100→100 唯一值）：总长不变，成功，错误清除
+    commitRow(c, 0, 'y'.repeat(100))
+    expect(notice(c)).toBeNull()
+    expect(rowText(rows(c)[0]).value).toBe('y'.repeat(100))
+
+    // 缩短到 99 → 299,999；再补 1 长恰好回到 300,000；继续新增才被拒
+    commitRow(c, 0, 'y'.repeat(99))
+    expect(addPatternViaUI(c, 'z')).toBe(true)
+    expect(notice(c)).toBeNull()
+    expect(enabledOverTotal(c)).toEqual({ enabled: 3001, total: 3001 })
+    expect(addPatternViaUI(c, 'q')).toBe(false)
+    expect(notice(c)).toBe('INVALID_PATTERN')
+    expect(enabledOverTotal(c)).toEqual({ enabled: 3001, total: 3001 })
+
+    // 边界处启停兼容
+    click(rowCheck(rows(c)[0]))
+    expect(enabledOverTotal(c)).toEqual({ enabled: 3000, total: 3001 })
+    click(rowCheck(rows(c)[0]))
+
+    // 采纳 + 下载：固化的正是当前可见工作预览（合法、可再载入的边界工作集）
+    click(buttonByText(c, '采纳为下载稿'))
+    const expected = workPreview(c)
+    expect(adoptedPreview(c)).toBe(expected)
+    const dl = stubDownload()
+    click(buttonByText(c, '下载 redacted.txt'))
+    dl.restore()
+    expect(dl.downloaded()).toBe(true)
+    expect(await dl.blobs[0].text()).toBe(expected)
+  })
+
+  it('边界处重算故障：成功增长保留、故障动作拒绝；恢复后采纳/下载仍为合法边界工作集', async () => {
+    const c = await renderApp('zz', uniquePatterns(49_999, 6))
+    // 先制造一次成功采纳（49,999 条的合法稿）
+    click(buttonByText(c, '采纳为下载稿'))
+    const oldDraft = adoptedPreview(c)
+
+    // 增长到 50,000 的这次重算抛错：新增被 COUNT_FAILED 拒绝
+    mockedMaskText.mockImplementationOnce(() => {
+      throw new Error('boom at boundary')
+    })
+    expect(addPatternViaUI(c, String(49_999).padStart(6, '0'))).toBe(false)
+    expect(notice(c)).toBe('COUNT_FAILED')
+    // 四类快照停在上一成功状态：49,999 条、预览为旧稿、输入框保留候选值
+    expect(enabledOverTotal(c)).toEqual({ enabled: 49_999, total: 49_999 })
+    expect(workPreview(c)).toBe(oldDraft)
+    expect(adoptedPreview(c)).toBe(oldDraft)
+    const addInput = c
+      .querySelector<HTMLElement>('.add-row')!
+      .querySelector<HTMLInputElement>('input')!
+    expect(addInput.value).toBe(String(49_999).padStart(6, '0'))
+
+    // 恢复：同一新增成功到恰好 50,000；采纳更新，下载文本成套
+    expect(addPatternViaUI(c, String(49_999).padStart(6, '0'))).toBe(true)
+    expect(notice(c)).toBeNull()
+    expect(enabledOverTotal(c)).toEqual({ enabled: 50_000, total: 50_000 })
+    click(buttonByText(c, '采纳为下载稿'))
+    expect(adoptedPreview(c)).toBe(workPreview(c))
+    const dl = stubDownload()
+    click(buttonByText(c, '下载 redacted.txt'))
+    dl.restore()
+    expect(dl.downloaded()).toBe(true)
+    expect(await dl.blobs[0].text()).toBe(workPreview(c))
   })
 })
