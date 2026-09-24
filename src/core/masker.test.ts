@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   INVALID_INPUT,
   INVALID_PATTERN,
+  LIMITS_EXCEEDED,
   LIMITS,
   MaskError,
   addEntry,
+  assertWorksetLimits,
   buildAutomaton,
   checkPatternValue,
   maskText,
@@ -573,6 +575,184 @@ describe('短语编辑：违规返回 INVALID_PATTERN 且不改动列表', () =>
     toggleEntry(b, 0, false)
     removeEntry(b, 0)
     expect(JSON.stringify(b)).toBe(snapshot)
+  })
+})
+
+describe('编辑聚合约束：与导入同源（数量 1..50,000、总长 ≤ 300,000）', () => {
+  /** 生成 count 条等长（width 字符）、互不相同的合法短语。 */
+  function fixedWidthPatterns(count: number, width: number): PatternEntry[] {
+    const out: PatternEntry[] = []
+    for (let i = 0; i < count; i++) {
+      const tail = String(i).padStart(width - 1, '0')
+      const value = 'p' + tail.slice(tail.length - (width - 1))
+      out.push({ value, enabled: true })
+    }
+    // 等长构造必须确实互不相同且总长达标，否则用例本身无效
+    expect(new Set(out.map((e) => e.value)).size).toBe(count)
+    expect(out[0].value).toHaveLength(width)
+    return out
+  }
+
+  /**
+   * 卡在总长上界下方 1：1499 条长 200 + 一条长 199（共 1500 条，
+   * 总长 299,999）。条目数远低于 50,000，因此本构造只逼近总长约束。
+   */
+  function nearTotalEntries(): PatternEntry[] {
+    const out: PatternEntry[] = []
+    for (let i = 0; i < 1499; i++) {
+      out.push({ value: String(i).padStart(7, '0') + 'x'.repeat(193), enabled: true })
+    }
+    out.push({ value: 'y'.repeat(199), enabled: true })
+    return out
+  }
+
+  function totalLen(entries: readonly PatternEntry[]): number {
+    return entries.reduce((s, e) => s + e.value.length, 0)
+  }
+
+  it('assertWorksetLimits：恰在边界合法，越界按给定错误码拒绝', () => {
+    expect(() =>
+      assertWorksetLimits(LIMITS.maxPatterns, LIMITS.maxTotalPatternLength, LIMITS_EXCEEDED),
+    ).not.toThrow()
+    expect(() => assertWorksetLimits(LIMITS.minPatterns, 1, LIMITS_EXCEEDED)).not.toThrow()
+    expectMaskError(LIMITS_EXCEEDED, () =>
+      assertWorksetLimits(LIMITS.maxPatterns + 1, 1, LIMITS_EXCEEDED),
+    )
+    expectMaskError(LIMITS_EXCEEDED, () =>
+      assertWorksetLimits(LIMITS.maxPatterns, LIMITS.maxTotalPatternLength + 1, LIMITS_EXCEEDED),
+    )
+    expectMaskError(LIMITS_EXCEEDED, () =>
+      assertWorksetLimits(LIMITS.minPatterns - 1, 0, LIMITS_EXCEEDED),
+    )
+    // 同一处断言供导入路径使用 INVALID_INPUT
+    expectMaskError(INVALID_INPUT, () =>
+      assertWorksetLimits(LIMITS.maxPatterns + 1, 1, INVALID_INPUT),
+    )
+  })
+
+  it('新增：恰好 50,000 条成功，第 50,001 条 → LIMITS_EXCEEDED', () => {
+    // 6 字符等长：49,999 条总长 299,994；补 6 字符恰好落在双边界
+    const entries = fixedWidthPatterns(LIMITS.maxPatterns - 1, 6)
+    const atLimit = addEntry(entries, 'q'.repeat(6))
+    expect(atLimit).toHaveLength(LIMITS.maxPatterns)
+    expect(totalLen(atLimit)).toBe(LIMITS.maxTotalPatternLength)
+    expectMaskError(LIMITS_EXCEEDED, () => addEntry(atLimit, 'z'.repeat(6)))
+    // 被拒绝后候选不外泄，入参保持原样
+    expect(entries).toHaveLength(LIMITS.maxPatterns - 1)
+    expect(atLimit).toHaveLength(LIMITS.maxPatterns)
+  })
+
+  it('新增：数量不超（仍 50,000）但总长越过 300,000 → LIMITS_EXCEEDED（仅总长触发）', () => {
+    // 49,999×6 = 299,994：加 6 字符合法（恰 300,000），加 7 字符总数仍为
+    // 50,000（数量合法）但总长 300,001 → 纯粹的总长越界
+    const entries = fixedWidthPatterns(LIMITS.maxPatterns - 1, 6)
+    expect(totalLen(entries)).toBe(LIMITS.maxTotalPatternLength - 6)
+    const atLimit = addEntry(entries, 'r'.repeat(6))
+    expect(atLimit).toHaveLength(LIMITS.maxPatterns)
+    expect(totalLen(atLimit)).toBe(LIMITS.maxTotalPatternLength)
+    expectMaskError(LIMITS_EXCEEDED, () => addEntry(entries, 'r'.repeat(7)))
+  })
+
+  it('新增（数量有余）：49,999 条×6 时补 6 字符恰好双边界、补 7 字符纯总长越界', () => {
+    const entries = fixedWidthPatterns(49_999, 6)
+    expect(entries).toHaveLength(49_999)
+    expect(totalLen(entries)).toBe(299_994)
+    const atLimit = addEntry(entries, 'r'.repeat(6))
+    expect(atLimit).toHaveLength(50_000)
+    expect(totalLen(atLimit)).toBe(300_000)
+    // 补 7 字符：数量仍 50,000（合法），总长 300,001 → 纯总长越界
+    expectMaskError(LIMITS_EXCEEDED, () => addEntry(entries, 'r'.repeat(7)))
+  })
+
+  it('新增：1499×200 + 199（300,000-1，共 1500 条）时加 1 字符合法，加 2 字符 → LIMITS_EXCEEDED', () => {
+    const entries = nearTotalEntries()
+    expect(entries).toHaveLength(1500)
+    expect(totalLen(entries)).toBe(LIMITS.maxTotalPatternLength - 1)
+    const atLimit = addEntry(entries, 'z')
+    expect(totalLen(atLimit)).toBe(LIMITS.maxTotalPatternLength)
+    expectMaskError(LIMITS_EXCEEDED, () => addEntry(entries, 'zw'))
+  })
+
+  it('修改：把唯一的“短名额”补长使总长恰好 300,000 → 合法；再多 → LIMITS_EXCEEDED', () => {
+    // 1499×200 + 一条 198 = 299,998（差 2 到上界，共 1500 条）
+    const entries: PatternEntry[] = []
+    for (let i = 0; i < 1499; i++) {
+      entries.push({ value: String(i).padStart(7, '0') + 'x'.repeat(193), enabled: true })
+    }
+    entries.push({ value: 's'.repeat(198), enabled: true })
+    expect(totalLen(entries)).toBe(LIMITS.maxTotalPatternLength - 2)
+    const atLimit = updateEntry(entries, 1499, 't'.repeat(200))
+    expect(totalLen(atLimit)).toBe(LIMITS.maxTotalPatternLength)
+    // 从差 2 的快照把同一条也改成 200（与上面不同的值，避免“值未变”）同样合法；
+    // 而改到 201 先被单条长度校验拦为 INVALID_PATTERN。真正越过总长只能靠新增。
+    const alsoAtLimit = updateEntry(entries, 1499, 'u'.repeat(200))
+    expect(totalLen(alsoAtLimit)).toBe(LIMITS.maxTotalPatternLength)
+    expectMaskError(INVALID_PATTERN, () => updateEntry(entries, 1499, 'v'.repeat(201)))
+    expectMaskError(LIMITS_EXCEEDED, () => addEntry(atLimit, 'z'))
+  })
+
+  it('删除：删除唯一短语 → LIMITS_EXCEEDED（空工作集永不成立）', () => {
+    const only: PatternEntry[] = [{ value: 'alpha', enabled: true }]
+    expectMaskError(LIMITS_EXCEEDED, () => removeEntry(only, 0))
+    expect(only).toEqual([{ value: 'alpha', enabled: true }])
+  })
+
+  it('删除：两条删到一条合法（恰为最小数量）', () => {
+    const two: PatternEntry[] = [
+      { value: 'alpha', enabled: true },
+      { value: 'beta', enabled: false },
+    ]
+    const one = removeEntry(two, 1)
+    expect(one.map((e) => e.value)).toEqual(['alpha'])
+  })
+
+  it('启停：恰在 50,000 条上界停用 / 启用不触发聚合错误', () => {
+    const entries = fixedWidthPatterns(LIMITS.maxPatterns, 6)
+    expect(totalLen(entries)).toBe(LIMITS.maxTotalPatternLength)
+    const off = toggleEntry(entries, 0, false)
+    expect(off[0].enabled).toBe(false)
+    const on = toggleEntry(off, 0, true)
+    expect(on[0].enabled).toBe(true)
+  })
+
+  it('聚合错误优先于重算：所有越界编辑都是不可变更新，入参不被修改', () => {
+    const only: PatternEntry[] = [{ value: 'alpha', enabled: true }]
+    // 50,000×6 双边界：任何新增都越界（数量与总长同时）
+    const full = fixedWidthPatterns(LIMITS.maxPatterns, 6)
+    const nearCap = nearTotalEntries()
+    for (const [label, fn] of [
+      ['删唯一', () => removeEntry(only, 0)],
+      ['新增超数量与总长', () => addEntry(full, 'z')],
+      ['新增超总长', () => addEntry(nearCap, 'yz')],
+    ] as const) {
+      const target = label === '删唯一' ? only : label === '新增超数量与总长' ? full : nearCap
+      const snapshot = JSON.stringify(target)
+      expectMaskError(LIMITS_EXCEEDED, fn)
+      expect(JSON.stringify(target)).toBe(snapshot)
+    }
+  })
+
+  it('单条违规仍为 INVALID_PATTERN，不误报为聚合错误', () => {
+    const entries = nearTotalEntries()
+    // 与现有值重复：先报重复（INVALID_PATTERN），即便聚合上也无名额
+    expectMaskError(INVALID_PATTERN, () => addEntry(entries, entries[0].value))
+    expectMaskError(INVALID_PATTERN, () => updateEntry(entries, -1, 'z'))
+    const only: PatternEntry[] = [{ value: 'alpha', enabled: true }]
+    expectMaskError(INVALID_PATTERN, () => removeEntry(only, 5))
+  })
+
+  it('parseInput 与编辑共用同一聚合断言：边界文件行为不变', () => {
+    // 数量 0 / 50001、总长 300000+1 的文件仍是 INVALID_INPUT（既有契约）
+    expectMaskError(INVALID_INPUT, () =>
+      parseInput(JSON.stringify({ text: 'a', patterns: [] })),
+    )
+    const tooMany = fixedWidthPatterns(LIMITS.maxPatterns + 1, 6).map((e) => e.value)
+    expectMaskError(INVALID_INPUT, () =>
+      parseInput(JSON.stringify({ text: 'a', patterns: tooMany })),
+    )
+    // 恰好边界（50,000×6 = 300,000）合法
+    const atLimit = fixedWidthPatterns(LIMITS.maxPatterns, 6).map((e) => e.value)
+    expect(() => parseInput(JSON.stringify({ text: 'a', patterns: atLimit }))).not.toThrow()
   })
 })
 

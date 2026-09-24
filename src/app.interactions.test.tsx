@@ -147,6 +147,9 @@ const workPreview = (c: HTMLElement) => c.querySelectorAll('pre.text-view')[0]!.
 const adoptedPreview = (c: HTMLElement) =>
   c.querySelectorAll('pre.text-view')[1]?.textContent ?? null
 const notice = (c: HTMLElement) => c.querySelector('[role=alert]')?.textContent ?? null
+/** 短语管理区的“显示 N / M 条”统计（DOM 中第一个 .stats，位于预览统计之前） */
+const listStats = (c: HTMLElement) =>
+  c.querySelector('.pattern-list')!.querySelector('.stats')!.textContent!
 
 /**
  * 成套一致性断言：列表行（值 / 启停 / 计数文案）与工作预览同源于一次
@@ -488,5 +491,166 @@ describe('连续交互：失焦提交与随后点击不互相覆盖', () => {
     ])
     expect(workPreview(c)).toBe('aaaa ####')
     expect(notice(c)).toBe('COUNT_FAILED')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 聚合约束（数量 1..50,000、总长 ≤ 300,000）的界面验收：越界动作只拒绝
+// 当前动作并完整保留最近一次成功的列表、计数、预览与采纳稿；恰在边界的
+// 启停、筛选、窗口化、合法下载保持兼容；错误码与四类快照成套一致。
+// ---------------------------------------------------------------------------
+describe('聚合约束：删除唯一短语与采纳交错', () => {
+  it('唯一短语删除被 LIMITS_EXCEEDED 拒绝：四类快照成套保留，恢复后可继续编辑', async () => {
+    const c = await renderApp('aXaY', ['X'])
+    // 先采纳，建立已采纳稿
+    click(buttonByText(c, '采纳为下载稿'))
+    expect(adoptedPreview(c)).toBe('a#aY')
+
+    // 删除唯一短语：被聚合约束拒绝
+    click(rowDelete(rows(c)[0]))
+    expect(notice(c)).toBe('LIMITS_EXCEEDED')
+    // 四类快照成套不变：列表行、计数、工作预览、采纳稿
+    expectRowsCoherent(c, [{ value: 'X', enabled: true, count: 1 }])
+    expect(workPreview(c)).toBe('a#aY')
+    expect(adoptedPreview(c)).toBe('a#aY')
+
+    // 拒绝后下一个合法动作照常生效（改值重算成功，错误清除）
+    typeInto(rowText(rows(c)[0]), 'Y')
+    act(() => rowText(rows(c)[0]).blur())
+    expect(notice(c)).toBeNull()
+    expectRowsCoherent(c, [{ value: 'Y', enabled: true, count: 1 }])
+    expect(workPreview(c)).toBe('aXa#')
+    // 采纳稿停在删除被拒之前的旧稿，未被任何失败/后续预览覆盖
+    expect(adoptedPreview(c)).toBe('a#aY')
+
+    // 此时仍只有一条：删除依旧被拒
+    click(rowDelete(rows(c)[0]))
+    expect(notice(c)).toBe('LIMITS_EXCEEDED')
+    expectRowsCoherent(c, [{ value: 'Y', enabled: true, count: 1 }])
+    expect(workPreview(c)).toBe('aXa#')
+
+    // 新增第二条后，删除任意一条都合法（数量恰在下界之上）
+    const addInput = c
+      .querySelector<HTMLElement>('.add-row')!
+      .querySelector<HTMLInputElement>('input')!
+    typeInto(addInput, 'X')
+    click(buttonByText(c, '添加'))
+    expect(notice(c)).toBeNull()
+    expectRowsCoherent(c, [
+      { value: 'Y', enabled: true, count: 1 },
+      { value: 'X', enabled: true, count: 1 },
+    ])
+    click(rowDelete(rows(c)[1]))
+    expect(notice(c)).toBeNull()
+    expectRowsCoherent(c, [{ value: 'Y', enabled: true, count: 1 }])
+  })
+
+  it('越界删除与采纳同手势：删除被拒，采纳不固化任何半提交工作集', async () => {
+    const c = await renderApp('aXaY', ['X'])
+    click(buttonByText(c, '采纳为下载稿'))
+    // 直接点删除按钮（普通点击手势），随后采纳：删除先被拒
+    click(rowDelete(rows(c)[0]))
+    expect(notice(c)).toBe('LIMITS_EXCEEDED')
+    click(buttonByText(c, '采纳为下载稿'))
+    // 采纳成功清除提示，但采纳稿与工作集都仍是合法的上次成功状态
+    expect(notice(c)).toBeNull()
+    expect(adoptedPreview(c)).toBe('a#aY')
+    expect(workPreview(c)).toBe('a#aY')
+    expectRowsCoherent(c, [{ value: 'X', enabled: true, count: 1 }])
+  })
+})
+
+describe('聚合约束：总长上界 300,000 的连续增改、启停、筛选与采纳交错', () => {
+  // 1499 条长 200 + 1 条 199 = 1500 条、总长 299,999（差 1 到上界）
+  function nearCapFile(): { text: string; patterns: string[] } {
+    const patterns: string[] = []
+    for (let i = 0; i < 1499; i++) {
+      patterns.push(String(i).padStart(7, '0') + 'x'.repeat(193))
+    }
+    patterns.push('y'.repeat(199))
+    return { text: 'x', patterns }
+  }
+
+  it('差 1 到上界：加 1 字符合法、加 2 字符拒绝；启停/筛选/计数不受影响', async () => {
+    const input = nearCapFile()
+    const c = await renderApp(input.text, input.patterns)
+    expect(listStats(c)).toContain('1,500')
+
+    // 加 1 字符：恰好 300,000，合法
+    const addInput = c
+      .querySelector<HTMLElement>('.add-row')!
+      .querySelector<HTMLInputElement>('input')!
+    typeInto(addInput, 'z')
+    click(buttonByText(c, '添加'))
+    expect(notice(c)).toBeNull()
+    expect(listStats(c)).toContain('1,501')
+
+    // 再加 2 字符：总长 300,002 → 拒绝，行计数与预览留在 1501 条的成功态
+    typeInto(addInput, 'zw')
+    click(buttonByText(c, '添加'))
+    expect(notice(c)).toBe('LIMITS_EXCEEDED')
+    expect(listStats(c)).toContain('1,501') // 没有半提交出第 1502 行
+    expect(addInput.value).toBe('zw') // 非法输入保留草稿
+
+    // 停用最后一条（单字符 'z'）不改变聚合量：先筛到该行再操作
+    setFilter(c, 'z')
+    expect(rows(c)).toHaveLength(1)
+    click(rowCheck(rows(c)[0]))
+    expect(notice(c)).toBeNull()
+    expect(rowCheck(rows(c)[0]).checked).toBe(false)
+    expect(rowCount(rows(c)[0]).textContent).toBe('未统计')
+    // 重新启用同样成功
+    click(rowCheck(rows(c)[0]))
+    expect(rowCheck(rows(c)[0]).checked).toBe(true)
+
+    // 筛选在边界规模上仍作用于全集：唯一短条目（199 个 y）可被定位
+    setFilter(c, 'yyy')
+    expect(rows(c)).toHaveLength(1)
+    // 不可能命中的筛选串返回空窗（不渲染行，但全集计数不变）
+    setFilter(c, '~~绝不可能命中~~')
+    expect(rows(c)).toHaveLength(0)
+    expect(listStats(c)).toContain('0 / 1,501')
+    setFilter(c, '')
+    expect(rows(c).length).toBeGreaterThan(1)
+    expect(listStats(c)).toContain('1,501 / 1,501')
+  })
+
+  it('采纳交错：上界附近越界新增被拒，采纳稿不变；合法新增后再次采纳更新', async () => {
+    const input = nearCapFile()
+    // 用单字符 'z' 作文本：载入态短语都很长、无法在单字符内匹配；
+    // 之后新增的单字符 'z' 恰好命中，遮蔽稿可据此区分新旧工作集。
+    const c = await renderApp('z', input.patterns)
+    click(buttonByText(c, '采纳为下载稿'))
+    const firstDraft = adoptedPreview(c)
+    // 没有任何短语能在单字符文本内完整匹配（最短短语也是 199 长），故为 'z'
+    expect(firstDraft).toBe('z')
+
+    // 先合法加 1 字符到上界（但不采纳），再越界新增：必须被拒
+    const addInput = c
+      .querySelector<HTMLElement>('.add-row')!
+      .querySelector<HTMLInputElement>('input')!
+    typeInto(addInput, 'z')
+    click(buttonByText(c, '添加'))
+    expect(notice(c)).toBeNull()
+    expect(listStats(c)).toContain('1,501 / 1,501')
+    typeInto(addInput, 'zw')
+    click(buttonByText(c, '添加'))
+    expect(notice(c)).toBe('LIMITS_EXCEEDED')
+    expect(listStats(c)).toContain('1,501 / 1,501')
+    // 已采纳稿仍是最初那份（遮蔽稿 'z'），未被越界动作波及
+    expect(adoptedPreview(c)).toBe(firstDraft)
+    // 工作预览来自 1501 条的上次成功快照；单字符 'z' 命中 → '#'
+    expect(workPreview(c)).toBe('#')
+
+    // 再次采纳：固化当前合法工作集（1501 条，'z' 命中），下载稿变为 '#'
+    click(buttonByText(c, '采纳为下载稿'))
+    expect(notice(c)).toBeNull()
+    expect(adoptedPreview(c)).toBe('#')
+
+    // 之后任何越界新增依旧被拒，采纳稿不动
+    typeInto(addInput, 'q')
+    click(buttonByText(c, '添加'))
+    expect(notice(c)).toBe('LIMITS_EXCEEDED')
+    expect(adoptedPreview(c)).toBe('#')
   })
 })

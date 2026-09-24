@@ -5,6 +5,10 @@
  * - 载入合法文件，或任何增改 / 启停 / 删除，都从**同一原文**与候选工作集
  *   重新构建自动机并一次性产出遮蔽预览与每条启用短语的完整匹配次数；
  *   计数与启用短语同序，预览与计数来自同一次重算，绝不增量修补。
+ * - 导入与所有编辑成功后的工作集始终遵守**同一组聚合约束**（数量
+ *   1..50,000、总长 ≤ 300,000）：候选工作集在重算之前先过聚合闸门，
+ *   越界增改或使数量低于最小数量的删除只抛 LIMITS_EXCEEDED 拒绝当前
+ *   动作，绝不重建自动机、绝不提交候选快照。
  * - 重算以候选快照提交：先对候选工作集完成全部计算，成功后才替换当前快照；
  *   自动机构建、遮蔽或计数阶段抛出任何异常，都转换为 COUNT_FAILED 抛出，
  *   并保留上一次成功的工作集、预览、计数与已采纳稿（由调用方不替换
@@ -15,8 +19,10 @@
 
 import {
   COUNT_FAILED,
+  LIMITS_EXCEEDED,
   MaskError,
   addEntry,
+  assertWorksetLimits,
   maskText,
   parseInput,
   removeEntry,
@@ -75,8 +81,14 @@ export function loadSession(jsonText: string): { session: LoadedSession; snapsho
 
 /**
  * 对候选工作集应用一次变更并完成重算，整体作为候选快照返回。
- * mutate 抛 INVALID_PATTERN（非法值/越界）时原样向上抛；recompute 抛
+ * mutate 抛 INVALID_PATTERN（非法值/越界）或 LIMITS_EXCEEDED（聚合约束
+ * 越界：数量 1..50,000、总长 ≤ 300,000）时原样向上抛；recompute 抛
  * COUNT_FAILED 时同样向上抛——两种情况下调用方都保留旧快照不变。
+ *
+ * 聚合约束在**重算之前**有一道集中闸门：任何路径（包括直接传入的泛型
+ * mutate）产出的候选工作集，只要数量或总长越界，立即抛 LIMITS_EXCEEDED，
+ * 绝不重建自动机、绝不产出快照。导入与所有编辑成功后的工作集因此始终
+ * 遵守同一组聚合约束。
  */
 export function applyChange(
   snapshot: Snapshot,
@@ -84,6 +96,9 @@ export function applyChange(
 ): Snapshot {
   // 变更函数都是不可变更新，异常不会部分修改 snapshot.entries
   const entries = mutate(snapshot.entries)
+  let totalLength = 0
+  for (const e of entries) totalLength += e.value.length
+  assertWorksetLimits(entries.length, totalLength, LIMITS_EXCEEDED)
   const result = recompute(snapshot.text, entries)
   return { text: snapshot.text, entries, result }
 }
